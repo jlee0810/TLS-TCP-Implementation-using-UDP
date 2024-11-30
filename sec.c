@@ -52,7 +52,7 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
         uint16_t length = htons(NONCE_SIZE);
         memcpy(client_hello_nonce + 1, &length, 2);
         memcpy(client_hello_nonce + 3, nonce, NONCE_SIZE);
-        
+
         uint8_t *client_hello_message[1 + 2 + sizeof(client_hello_nonce)];
         client_hello_message[0] = CLIENT_HELLO;
         uint16_t nonce_msg_length = htons(sizeof(client_hello_nonce));
@@ -62,10 +62,8 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
         size_t client_hello_length = 1 + 2 + sizeof(client_hello_message);
         memcpy(buf, client_hello_message, client_hello_length);
 
-
         state_sec = CLIENT_SERVER_HELLO_AWAIT;
         return client_hello_length;
-
 
         // /* Insert Client Hello sending logic here */
         // state_sec = CLIENT_SERVER_HELLO_AWAIT;
@@ -77,8 +75,53 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
 
         /* Insert Server Hello sending logic here */
 
+        // Nonce
+        uint8_t server_hello_nonce[1 + 2 + NONCE_SIZE];
+        server_hello_nonce[0] = NONCE_SERVER_HELLO;
+        uint16_t nonce_length = htons(NONCE_SIZE);
+        memcpy(server_hello_nonce + 1, &nonce_length, 2);
+        memcpy(server_hello_nonce + 3, nonce, NONCE_SIZE);
+        size_t server_hello_nonce_size = sizeof(server_hello_nonce);
+
+        // Certificate (already in TLV)
+        size_t server_certificate_size = cert_size;
+        uint8_t *server_certificate = malloc(server_certificate_size);
+        memcpy(server_certificate, certificate, server_certificate_size);
+
+        // Sign Client Nonce
+        uint8_t client_nonce_sign[72];
+        size_t client_nonce_sign_size = sign(peer_nonce, NONCE_SIZE, client_nonce_sign);
+
+        size_t signature_size = 1 + 2 + client_nonce_sign_size;
+        uint8_t *signature = malloc(signature_size);
+        signature[0] = NONCE_SIGNATURE_SERVER_HELLO;
+        uint16_t sign_length = htons(client_nonce_sign_size);
+        memcpy(signature + 1, &sign_length, 2);
+        memcpy(signature + 3, client_nonce_sign, client_nonce_sign_size);
+
+        size_t nested_length = server_hello_nonce_size + server_certificate_size + signature_size;
+
+        // Server Hello
+        size_t total_server_hello_length = 1 + 2 + nested_length;
+        uint8_t *server_hello = malloc(total_server_hello_length);
+        server_hello[0] = SERVER_HELLO;
+        uint16_t server_hello_length_field = htons(nested_length);
+        memcpy(server_hello + 1, &server_hello_length_field, 2);
+        size_t offset = 3;
+        memcpy(server_hello + offset, server_hello_nonce, server_hello_nonce_size);
+        offset += server_hello_nonce_size;
+        memcpy(server_hello + offset, server_certificate, server_certificate_size);
+        offset += server_certificate_size;
+        memcpy(server_hello + offset, signature, signature_size);
+
+        memcpy(buf, server_hello, total_server_hello_length);
+
+        free(server_certificate);
+        free(signature);
+        free(server_hello);
+
         state_sec = SERVER_KEY_EXCHANGE_REQUEST_AWAIT;
-        return 0;
+        return total_server_hello_length;
     }
     case CLIENT_KEY_EXCHANGE_REQUEST_SEND:
     {
@@ -116,7 +159,7 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
 void output_sec(uint8_t *buf, size_t length)
 {
     // This passes it directly to standard output (working like Project 1)
-    return output_io(buf, length);
+    // return output_io(buf, length);
 
     switch (state_sec)
     {
@@ -128,6 +171,10 @@ void output_sec(uint8_t *buf, size_t length)
         print("RECV CLIENT HELLO");
 
         /* Insert Client Hello receiving logic here */
+        uint8_t *p = buf + 3;
+
+        uint8_t nested_type = p[0];
+        memcpy(peer_nonce, p + 3, NONCE_SIZE);
 
         state_sec = SERVER_SERVER_HELLO_SEND;
         break;
