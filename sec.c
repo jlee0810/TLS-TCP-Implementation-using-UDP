@@ -14,6 +14,9 @@ uint8_t peer_nonce[NONCE_SIZE]; // Store peer's nonce to sign
 uint8_t *server_hello_message = NULL;
 size_t server_hello_message_length = 0;
 
+uint8_t *client_key_exchange_request = NULL;
+size_t client_key_exchange_request_length = 0;
+
 void init_sec(int initial_state)
 {
     state_sec = initial_state;
@@ -266,12 +269,120 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
     case SERVER_FINISHED_SEND:
     {
         print("SEND FINISHED");
-
         /* Insert Finished sending logic here */
+        uint8_t *buf_received = client_key_exchange_request;
+        size_t length_received = client_key_exchange_request_length;
+
+        uint16_t client_key_exchange_length = ntohs(*(uint16_t *)(buf_received + 1));
+        uint8_t *p = buf_received + 3;
+        size_t remaining = client_key_exchange_length;
+
+        uint8_t *client_certificate = NULL;
+        size_t client_certificate_length = 0;
+        uint8_t *nonce_signature = NULL;
+        size_t nonce_signature_length = 0;
+
+        while (remaining > 0)
+        {
+            uint8_t type = p[0];
+            uint16_t length = ntohs(*(uint16_t *)(p + 1));
+            uint8_t *value = p + 3;
+
+            switch (type)
+            {
+            case CERTIFICATE:
+                client_certificate_length = length;
+                client_certificate = malloc(client_certificate_length);
+                memcpy(client_certificate, value, client_certificate_length);
+                break;
+
+            case NONCE_SIGNATURE_KEY_EXCHANGE_REQUEST:
+                nonce_signature_length = length;
+                nonce_signature = malloc(nonce_signature_length);
+                memcpy(nonce_signature, value, nonce_signature_length);
+                break;
+
+            default:
+                break;
+            }
+
+            p += 3 + length;
+            remaining -= 3 + length;
+        }
+
+        uint8_t *cert_p = client_certificate;
+        size_t cert_remaining = client_certificate_length;
+
+        uint8_t *client_public_key = NULL;
+        size_t client_public_key_length = 0;
+        uint8_t *public_key_signature = NULL;
+        size_t public_key_signature_length = 0;
+
+        while (cert_remaining > 0)
+        {
+            uint8_t nested_type = cert_p[0];
+            uint16_t nested_length = ntohs(*(uint16_t *)(cert_p + 1));
+
+            uint8_t *nested_value = cert_p + 3;
+
+            switch (nested_type)
+            {
+            case PUBLIC_KEY:
+                client_public_key_length = nested_length;
+                client_public_key = malloc(client_public_key_length);
+                memcpy(client_public_key, nested_value, client_public_key_length);
+                break;
+
+            case SIGNATURE:
+                public_key_signature_length = nested_length;
+                public_key_signature = malloc(public_key_signature_length);
+                memcpy(public_key_signature, nested_value, public_key_signature_length);
+                break;
+
+            default:
+                break;
+            }
+
+            cert_p += 3 + nested_length;
+            cert_remaining -= 3 + nested_length;
+        }
+
+        // Verify client's self-signed certificate
+        load_peer_public_key(client_public_key, client_public_key_length);
+        int cert_verify = verify(client_public_key, client_public_key_length, public_key_signature, public_key_signature_length, ec_peer_public_key);
+        if (cert_verify != 1)
+        {
+            fprintf(stderr, "Certificate verification failed\n");
+            exit(1);
+        }
+        // Verify signature of server's nonce
+        int nonce_verify = verify(nonce, NONCE_SIZE, nonce_signature, nonce_signature_length, ec_peer_public_key);
+        if (nonce_verify != 1)
+        {
+            fprintf(stderr, "Nonce verification failed\n");
+            exit(2);
+        }
+
+        fprintf(stderr, "Certificate and nonce verification passed\n");
+
+        derive_secret();
+        derive_keys();
+
+        free(client_certificate);
+        free(client_public_key);
+        free(public_key_signature);
+        free(nonce_signature);
+        free(client_key_exchange_request);
+        client_key_exchange_request = NULL;
+
+        buf[0] = FINISHED;
+        uint16_t finished_length = htons(0);
+        memcpy(buf + 1, &finished_length, 2);
 
         state_sec = DATA_STATE;
-        return 0;
+        return 3;
     }
+
     case DATA_STATE:
     {
         /* Insert Data sending logic here */
@@ -333,6 +444,9 @@ void output_sec(uint8_t *buf, size_t length)
         print("RECV KEY EXCHANGE REQUEST");
 
         /* Insert Key Exchange Request receiving logic here */
+        client_key_exchange_request = malloc(length);
+        client_key_exchange_request_length = length;
+        memcpy(client_key_exchange_request, buf, length);
 
         state_sec = SERVER_FINISHED_SEND;
         break;
