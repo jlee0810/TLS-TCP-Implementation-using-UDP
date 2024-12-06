@@ -391,7 +391,79 @@ ssize_t input_sec(uint8_t *buf, size_t max_length)
         // CT refers to the resulting ciphertext size
         // fprintf(stderr, "SEND DATA PT %ld CT %lu\n", stdin_size, cip_size);
 
-        return 0;
+        size_t max_payload_size = max_length > 1012 ? 1012 : max_length;
+
+        size_t data_message_header_size = 3;
+        size_t iv_message_size = 1 + 2 + IV_SIZE;
+        size_t mac_message_size = 1 + 2 + MAC_SIZE;
+        size_t ciphertext_message_header_size = 3;
+
+        size_t overhead = data_message_header_size + iv_message_size + mac_message_size + ciphertext_message_header_size;
+
+        size_t max_ciphertext_size = max_payload_size - overhead;
+        size_t max_blocks = max_ciphertext_size / 16;
+        size_t max_potential_ciphertext_size = max_blocks * 16;
+        size_t max_plaintext_size = max_potential_ciphertext_size - 1;
+
+        uint8_t plaintext[max_plaintext_size];
+        ssize_t plaintext_len = input_io(plaintext, max_plaintext_size);
+
+        // Encrypt plaintext
+        uint8_t iv[IV_SIZE];
+        uint8_t ciphertext[plaintext_len];
+        size_t ciphertext_len = encrypt_data(plaintext, plaintext_len, iv, ciphertext);
+
+        uint8_t hmac_input[IV_SIZE + ciphertext_len];
+        memcpy(hmac_input, iv, IV_SIZE);
+        memcpy(hmac_input + IV_SIZE, ciphertext, ciphertext_len);
+
+        // Create an HMAC digest of IV + ciphertext
+        uint8_t hmac_digest[MAC_SIZE];
+        hmac(hmac_input, IV_SIZE + ciphertext_len, hmac_digest);
+
+        // Data message TLV
+        size_t offset = 0;
+        uint8_t data_message[max_payload_size];
+
+        data_message[offset] = DATA;
+        offset += 1;
+        uint16_t data_length = iv_message_size + ciphertext_message_header_size + ciphertext_len + mac_message_size;
+        uint16_t data_length_net = htons(data_length);
+        memcpy(data_message + offset, &data_length_net, 2);
+        offset += 2;
+
+        // IV message
+        data_message[offset] = INITIALIZATION_VECTOR;
+        offset += 1;
+        uint16_t iv_length_net = htons(IV_SIZE);
+        memcpy(data_message + offset, &iv_length_net, 2);
+        offset += 2;
+        memcpy(data_message + offset, iv, IV_SIZE);
+        offset += IV_SIZE;
+
+        // Ciphertext message
+        data_message[offset] = CIPHERTEXT;
+        offset += 1;
+        uint16_t ciphertext_length_net = htons(ciphertext_len);
+        memcpy(data_message + offset, &ciphertext_length_net, 2);
+        offset += 2;
+        memcpy(data_message + offset, ciphertext, ciphertext_len);
+        offset += ciphertext_len;
+
+        // MAC message
+        data_message[offset] = MESSAGE_AUTHENTICATION_CODE;
+        offset += 1;
+        uint16_t mac_length_net = htons(MAC_SIZE);
+        memcpy(data_message + offset, &mac_length_net, 2);
+        offset += 2;
+        memcpy(data_message + offset, hmac_digest, MAC_SIZE);
+        offset += MAC_SIZE;
+
+        memcpy(buf, data_message, offset);
+
+        fprintf(stderr, "SEND DATA PT %ld CT %lu\n", plaintext_len, ciphertext_len);
+
+        return offset;
     }
     default:
         return 0;
@@ -471,6 +543,68 @@ void output_sec(uint8_t *buf, size_t length)
         // PT refers to the resulting plaintext size in bytes
         // CT refers to the received ciphertext size
         // fprintf(stderr, "RECV DATA PT %ld CT %hu\n", data_len, cip_len);
+        size_t offset = 1;
+        uint16_t data_length = ntohs(*(uint16_t *)(buf + offset));
+        offset += 2;
+
+        size_t remaining = data_length;
+        uint8_t *p = buf + offset;
+
+        uint8_t iv[IV_SIZE];
+        uint8_t *ciphertext = NULL;
+        size_t ciphertext_len = 0;
+        uint8_t received_mac[MAC_SIZE];
+
+        while (remaining > 0)
+        {
+            uint8_t type = p[0];
+            uint16_t length = ntohs(*(uint16_t *)(p + 1));
+            uint8_t *value = p + 3;
+
+            switch (type)
+            {
+            case INITIALIZATION_VECTOR:
+                memcpy(iv, value, IV_SIZE);
+                break;
+
+            case CIPHERTEXT:
+                ciphertext_len = length;
+                ciphertext = malloc(ciphertext_len);
+                memcpy(ciphertext, value, ciphertext_len);
+                break;
+
+            case MESSAGE_AUTHENTICATION_CODE:
+                memcpy(received_mac, value, MAC_SIZE);
+                break;
+
+            default:
+                break;
+            }
+
+            p += 3 + length;
+            remaining -= 3 + length;
+        }
+
+        uint8_t hmac_input[IV_SIZE + ciphertext_len];
+        memcpy(hmac_input, iv, IV_SIZE);
+        memcpy(hmac_input + IV_SIZE, ciphertext, ciphertext_len);
+
+        uint8_t calculated_mac[MAC_SIZE];
+        hmac(hmac_input, IV_SIZE + ciphertext_len, calculated_mac);
+
+        // Check if the digest matches the MAC code in the received Data message
+        if (memcmp(received_mac, calculated_mac, MAC_SIZE) != 0)
+            exit(3);
+
+        // Decrypt
+        uint8_t plaintext[ciphertext_len];
+        size_t plaintext_len = decrypt_cipher(ciphertext, ciphertext_len, iv, plaintext);
+
+        output_io(plaintext, plaintext_len);
+
+        fprintf(stderr, "RECV DATA PT %lu CT %lu\n", plaintext_len, ciphertext_len);
+
+        free(ciphertext);
         break;
     }
     default:
